@@ -45,8 +45,18 @@ type WatchList struct {
 	FileFilter []string
 }
 
-// Main runs the build script. Calling Main will also call flag.Parse().
-func Main(executableName string, compile CompilerJob, watchList WatchList) {
+type BuildStep struct {
+	WatchList WatchList
+	Compile   CompilerJob
+}
+
+type Build struct {
+	ExecutableName string
+	Steps          []BuildStep
+}
+
+// Main runs the build pipeline. Calling Run will also call flag.Parse().
+func (b Build) Run(ctx context.Context) {
 	var conf CompileConfig
 	watch := false
 	run := false
@@ -55,44 +65,120 @@ func Main(executableName string, compile CompilerJob, watchList WatchList) {
 	flag.StringVar(&conf.GOARCH, "GOARCH", "", "Cross-compile for architecture")
 	flag.StringVar(&conf.GOOS, "GOOS", "", "Cross-compile for operating system")
 	flag.BoolVar(&watch, "watch", false, "Watch source tree for changes")
-	flag.BoolVar(&run, "run", false, "Run "+executableName+" upon successful compilation")
+	flag.BoolVar(&run, "run", false, "Run "+b.ExecutableName+" upon successful compilation")
 	flag.Parse()
 
-	if conf.Development && conf.Quick {
-		//log.Printf("")
-		//log.Printf("You requested a quick build. This will assume")
-		//log.Printf(" you have a version of  `sassc`  running")
-		//log.Printf(" in a separate process.")
-		//log.Printf("")
+	status := make([]sourceTreeStatus, len(b.Steps))
+
+	// Compile all steps once
+	for i, bs := range b.Steps {
+		err := bs.Compile(ctx, conf)
+		if err != nil {
+			if watch {
+				log.Printf("compilation error: %v", err)
+				for j := i; j < len(b.Steps); j++ {
+					status[j].Broken = true
+				}
+				break
+			} else {
+				log.Fatalf("compilation error: %v", err)
+			}
+		}
 	}
 
-	compile = withVersion(compile)
-
-	var theJob job
-
+	restart := make(chan int)
+	runErr := make(chan error)
+	defer close(restart)
 	if run {
-		theJob = func(ctx context.Context) error {
-			err := compile(ctx, conf)
-			if err != nil {
-				return err
+		runArgs := append([]string{b.ExecutableName}, flag.Args()...)
+		go func() {
+			cctx, cancel := context.WithCancel(ctx)
+			r := func(ctx context.Context) {
+				runErr <- Passthru(ctx, runArgs...)
 			}
-			runArgs := append([]string{executableName}, flag.Args()...)
-			return Passthru(ctx, runArgs...)
-		}
-	} else {
-		theJob = func(ctx context.Context) error {
-			return compile(ctx, conf)
-		}
+			go r(cctx)
+			for range restart {
+				cancel()
+				<-runErr
+				cctx, cancel = context.WithCancel(ctx)
+				go r(cctx)
+			}
+		}()
 	}
 
 	if watch {
-		theJob = watchSourceTree(watchList, theJob)
+		for i, st := range b.Steps {
+			status[i].TreeHash = sourceTreeHash(st.WatchList)
+		}
+
+		for ctx.Err() == nil {
+			time.Sleep(250 * time.Millisecond)
+
+			for i, st := range b.Steps {
+				th := sourceTreeHash(st.WatchList)
+				if status[i].TreeHash != th {
+					status[i].Dirty = true
+					status[i].Broken = false
+
+					for j := i + 1; j < len(status); j++ {
+						if status[j].Broken {
+							// Perhaps step j broke because of something step i did.
+							status[j].Dirty = true
+							status[j].Broken = false
+						} else if !conf.Quick {
+							// The source for build step i changed, so we also invalidate *all* build steps after
+							// (Unless we're doing a duick build.)
+							status[j].Dirty = true
+						}
+					}
+					status[i].TreeHash = th
+				}
+			}
+
+			shouldRestart := false
+			for i, bs := range b.Steps {
+				if !status[i].Dirty {
+					continue
+				}
+				log.Printf("recompiling step %d", i)
+				if i == len(b.Steps)-1 {
+					shouldRestart = true
+				}
+				status[i].Dirty = false
+				err := bs.Compile(ctx, conf)
+				if err != nil {
+					log.Printf("compilation error: %v", err)
+					break
+				} else {
+					status[i].Broken = true
+				}
+			}
+			if shouldRestart {
+				restart <- 0
+			}
+		}
 	}
 
-	err := theJob(context.Background())
-	if err != nil {
-		log.Fatal(err)
+	if run {
+		err := <-runErr
+		close(runErr)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
+}
+
+// Main runs the build script. Calling Main will also call flag.Parse().
+func Main(executableName string, compile CompilerJob, watchList WatchList) {
+	Build{
+		ExecutableName: executableName,
+		Steps: []BuildStep{
+			{
+				WatchList: watchList,
+				Compile:   compile,
+			},
+		},
+	}.Run(context.Background())
 }
 
 func withVersion(compile CompilerJob) CompilerJob {
@@ -124,6 +210,12 @@ func PassthruCmd(c *exec.Cmd) error {
 	c.Stderr = os.Stderr
 	c.Stdin = os.Stdin
 	return c.Run()
+}
+
+type sourceTreeStatus struct {
+	TreeHash string
+	Dirty    bool
+	Broken   bool
 }
 
 func watchSourceTree(watchList WatchList, childJob job) job {
