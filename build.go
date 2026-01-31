@@ -103,6 +103,7 @@ func (b Build) Run(ctx context.Context) {
 				cctx, cancel = context.WithCancel(ctx)
 				go r(cctx)
 			}
+			cancel()
 		}()
 	}
 
