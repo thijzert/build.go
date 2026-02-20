@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -90,14 +91,22 @@ func (b Build) Run(ctx context.Context) {
 	runErr := make(chan error)
 	defer close(restart)
 	if run {
-		runArgs := append([]string{b.ExecutableName}, flag.Args()...)
 		go func() {
+			var cmd *exec.Cmd
 			cctx, cancel := context.WithCancel(ctx)
 			r := func(ctx context.Context) {
-				runErr <- Passthru(ctx, runArgs...)
+				cmd = exec.CommandContext(ctx, b.ExecutableName, flag.Args()...)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				cmd.Stdin = os.Stdin
+				runErr <- cmd.Run()
 			}
 			go r(cctx)
 			for range restart {
+				if cmd != nil && cmd.Process != nil {
+					cmd.Process.Signal(syscall.SIGINT)
+				}
+				time.Sleep(50 * time.Millisecond)
 				cancel()
 				<-runErr
 				cctx, cancel = context.WithCancel(ctx)
